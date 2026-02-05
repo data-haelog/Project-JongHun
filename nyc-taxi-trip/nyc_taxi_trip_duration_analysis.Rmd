@@ -1,0 +1,909 @@
+---
+title: "NYC Taxi Trip Duration - Advanced Analysis"
+author: "Data Analysis"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 6,
+  fig.align = 'center'
+)
+```
+
+# Setup
+
+```{r libraries}
+library(data.table)
+library(lubridate)
+library(ggplot2)
+library(rpart)
+library(randomForest)
+library(caret)
+library(scales)
+library(reshape2)
+```
+
+```{r load_data}
+train <- fread("data/train.csv")
+
+# Filtering
+train <- train[
+  passenger_count >= 1 & passenger_count <= 6 &
+    trip_duration <= 36000
+]
+
+cat("Total trips after filtering:", comma(nrow(train)), "\n")
+```
+
+```{r feature_engineering}
+# Time features
+train[, hour := hour(pickup_datetime)]
+train[, is_weekend := wday(pickup_datetime) %in% c(1, 7)]
+train[, date := as.Date(pickup_datetime)]
+train[, month := month(pickup_datetime)]
+train[, day := day(pickup_datetime)]
+
+# Distance calculation
+haversine <- function(lat1, lon1, lat2, lon2){
+  R <- 6371
+  dlat <- (lat2 - lat1) * pi / 180
+  dlon <- (lon2 - lon1) * pi / 180
+  a <- sin(dlat/2)^2 +
+    cos(lat1*pi/180) * cos(lat2*pi/180) *
+    sin(dlon/2)^2
+  2 * R * asin(sqrt(a))
+}
+
+train[, distance_km := haversine(
+  pickup_latitude, pickup_longitude,
+  dropoff_latitude, dropoff_longitude
+)]
+```
+
+---
+
+# Deep EDA
+
+## Outlier Detection and Analysis
+
+```{r outlier_detection}
+# Calculate Z-scores for key variables
+train[, duration_zscore := scale(trip_duration)]
+train[, distance_zscore := scale(distance_km)]
+
+# Identify outliers (|Z| > 3)
+outliers <- train[abs(duration_zscore) > 3 | abs(distance_zscore) > 3]
+
+cat("Total outliers detected:", comma(nrow(outliers)), 
+    "(", round(nrow(outliers)/nrow(train)*100, 2), "%)\n")
+cat("Duration outliers:", comma(sum(abs(train$duration_zscore) > 3)), "\n")
+cat("Distance outliers:", comma(sum(abs(train$distance_zscore) > 3)), "\n")
+```
+
+```{r outlier_visualization}
+# Boxplot for duration
+p1 <- ggplot(train, aes(y = trip_duration/60)) +
+  geom_boxplot(fill = "#2E86AB", alpha = 0.6) +
+  labs(
+    title = "Trip Duration Distribution with Outliers",
+    y = "Trip Duration (minutes)"
+  ) +
+  coord_flip() +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+
+# Boxplot for distance
+p2 <- ggplot(train, aes(y = distance_km)) +
+  geom_boxplot(fill = "#A23B72", alpha = 0.6) +
+  labs(
+    title = "Distance Distribution with Outliers",
+    y = "Distance (km)"
+  ) +
+  coord_flip() +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+
+print(p1)
+print(p2)
+```
+
+```{r outlier_analysis}
+# Outlier characteristics
+outlier_summary <- data.table(
+  Type = c("Normal Trips", "Outlier Trips"),
+  Count = c(nrow(train) - nrow(outliers), nrow(outliers)),
+  Avg_Duration = c(
+    mean(train[abs(duration_zscore) <= 3 & abs(distance_zscore) <= 3, trip_duration]),
+    mean(outliers$trip_duration)
+  ),
+  Avg_Distance = c(
+    mean(train[abs(duration_zscore) <= 3 & abs(distance_zscore) <= 3, distance_km]),
+    mean(outliers$distance_km)
+  )
+)
+
+outlier_summary
+```
+
+## Correlation Matrix
+
+```{r correlation_prep}
+# Select numeric variables
+cor_vars <- train[, .(
+  trip_duration,
+  distance_km,
+  hour,
+  passenger_count,
+  pickup_longitude,
+  pickup_latitude,
+  dropoff_longitude,
+  dropoff_latitude
+)]
+
+# Calculate correlation matrix
+cor_matrix <- cor(cor_vars, use = "complete.obs")
+```
+
+```{r correlation_heatmap}
+# Convert to long format for ggplot
+cor_long <- reshape2::melt(cor_matrix)
+names(cor_long) <- c("Var1", "Var2", "Correlation")
+
+ggplot(cor_long, aes(x = Var1, y = Var2, fill = Correlation)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(Correlation, 2)), size = 3) +
+  scale_fill_gradient2(
+    low = "#2E86AB", 
+    mid = "white", 
+    high = "#A23B72",
+    midpoint = 0,
+    limit = c(-1, 1)
+  ) +
+  labs(
+    title = "Correlation Matrix of Key Variables",
+    x = "",
+    y = ""
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  )
+```
+
+```{r correlation_insights}
+# Find strongest correlations (excluding diagonal)
+diag(cor_matrix) <- NA
+cor_pairs <- which(abs(cor_matrix) > 0.5 & !is.na(cor_matrix), arr.ind = TRUE)
+
+if(nrow(cor_pairs) > 0) {
+  cat("\nStrong correlations (|r| > 0.5):\n")
+  for(i in 1:nrow(cor_pairs)) {
+    var1 <- rownames(cor_matrix)[cor_pairs[i, 1]]
+    var2 <- colnames(cor_matrix)[cor_pairs[i, 2]]
+    cor_val <- cor_matrix[cor_pairs[i, 1], cor_pairs[i, 2]]
+    if(var1 < var2) {  # Avoid duplicates
+      cat(sprintf("  %s ~ %s: %.3f\n", var1, var2, cor_val))
+    }
+  }
+}
+```
+
+## Distance Bins Analysis
+
+```{r distance_bins}
+# Create distance bins
+train[, distance_bin := cut(
+  distance_km,
+  breaks = c(0, 2, 5, 10, 20, Inf),
+  labels = c("0-2km", "2-5km", "5-10km", "10-20km", "20km+"),
+  include.lowest = TRUE
+)]
+
+distance_analysis <- train[, .(
+  avg_duration = as.numeric(mean(trip_duration)),
+  median_duration = as.numeric(median(trip_duration)),
+  sd_duration = as.numeric(sd(trip_duration)),
+  total_trips = .N,
+  avg_speed = as.numeric(mean((distance_km / trip_duration) * 3600, na.rm = TRUE))
+), by = distance_bin]
+
+distance_analysis
+```
+
+```{r distance_bins_plot}
+ggplot(distance_analysis, aes(x = distance_bin, y = avg_duration, fill = distance_bin)) +
+  geom_col(alpha = 0.8) +
+  geom_text(aes(label = comma(total_trips)), vjust = -0.5, size = 3) +
+  scale_fill_manual(values = c("#2E86AB", "#5FA8D3", "#8FC0E5", "#B8D8F0", "#E1EFF9")) +
+  labs(
+    title = "Average Trip Duration by Distance Range",
+    subtitle = "Numbers show trip counts",
+    x = "Distance Range",
+    y = "Average Duration (seconds)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, size = 10),
+    legend.position = "none"
+  )
+```
+
+```{r distance_speed_plot}
+ggplot(distance_analysis, aes(x = distance_bin, y = avg_speed, group = 1)) +
+  geom_line(color = "#2E86AB", size = 1.2) +
+  geom_point(color = "#A23B72", size = 3) +
+  labs(
+    title = "Average Speed by Distance Range",
+    x = "Distance Range",
+    y = "Average Speed (km/h)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+## Duration Bins Analysis
+
+```{r duration_bins}
+# Create duration bins
+train[, duration_bin := cut(
+  trip_duration/60,
+  breaks = c(0, 5, 10, 15, 20, 30, Inf),
+  labels = c("0-5min", "5-10min", "10-15min", "15-20min", "20-30min", "30min+"),
+  include.lowest = TRUE
+)]
+
+duration_analysis <- train[, .(
+  avg_distance = as.numeric(mean(distance_km)),
+  median_distance = as.numeric(median(distance_km)),
+  total_trips = .N,
+  pct_weekend = as.numeric(mean(is_weekend) * 100)
+), by = duration_bin]
+
+duration_analysis
+```
+
+```{r duration_bins_plot}
+ggplot(duration_analysis, aes(x = duration_bin, y = avg_distance, fill = duration_bin)) +
+  geom_col(alpha = 0.8) +
+  geom_text(aes(label = comma(total_trips)), vjust = -0.5, size = 3) +
+  scale_fill_manual(values = c("#2E86AB", "#5FA8D3", "#8FC0E5", "#B8D8F0", "#E1EFF9", "#F5F5F5")) +
+  labs(
+    title = "Average Distance by Trip Duration Range",
+    subtitle = "Numbers show trip counts",
+    x = "Duration Range",
+    y = "Average Distance (km)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, size = 10),
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+## Vendor Deep Dive
+
+```{r vendor_distance_comparison}
+vendor_distance <- train[, .(
+  avg_distance = as.numeric(mean(distance_km)),
+  median_distance = as.numeric(median(distance_km)),
+  sd_distance = as.numeric(sd(distance_km))
+), by = vendor_id]
+
+vendor_distance
+```
+
+```{r vendor_by_hour}
+vendor_hourly <- train[, .(
+  avg_duration = as.numeric(mean(trip_duration)),
+  total_trips = .N
+), by = .(vendor_id, hour)]
+
+ggplot(vendor_hourly, aes(x = hour, y = total_trips, 
+                          color = factor(vendor_id), group = vendor_id)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  scale_color_manual(
+    values = c("1" = "#2E86AB", "2" = "#A23B72"),
+    name = "Vendor"
+  ) +
+  labs(
+    title = "Trip Volume by Hour and Vendor",
+    x = "Hour of Day",
+    y = "Number of Trips"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "top"
+  )
+```
+
+```{r vendor_by_distance_bin}
+vendor_distance_bin <- train[, .(
+  total_trips = .N,
+  pct = .N / nrow(train) * 100
+), by = .(vendor_id, distance_bin)]
+
+ggplot(vendor_distance_bin, aes(x = distance_bin, y = pct, 
+                                 fill = factor(vendor_id))) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  scale_fill_manual(
+    values = c("1" = "#2E86AB", "2" = "#A23B72"),
+    name = "Vendor"
+  ) +
+  labs(
+    title = "Trip Distribution by Distance Range and Vendor",
+    x = "Distance Range",
+    y = "Percentage of Trips (%)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "top"
+  )
+```
+
+```{r vendor_passenger_pattern}
+vendor_passenger <- train[, .(
+  avg_duration = as.numeric(mean(trip_duration)),
+  total_trips = .N
+), by = .(vendor_id, passenger_count)]
+
+ggplot(vendor_passenger, aes(x = factor(passenger_count), y = avg_duration,
+                              fill = factor(vendor_id))) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  scale_fill_manual(
+    values = c("1" = "#2E86AB", "2" = "#A23B72"),
+    name = "Vendor"
+  ) +
+  labs(
+    title = "Average Duration by Passenger Count and Vendor",
+    x = "Number of Passengers",
+    y = "Average Duration (seconds)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "top"
+  )
+```
+
+```{r vendor_weekend_pattern}
+vendor_weekend <- train[, .(
+  avg_duration = as.numeric(mean(trip_duration)),
+  total_trips = .N
+), by = .(vendor_id, is_weekend)]
+
+ggplot(vendor_weekend, aes(x = factor(is_weekend), y = avg_duration,
+                            fill = factor(vendor_id))) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  scale_fill_manual(
+    values = c("1" = "#2E86AB", "2" = "#A23B72"),
+    name = "Vendor",
+    labels = c("Vendor 1", "Vendor 2")
+  ) +
+  scale_x_discrete(labels = c("Weekday", "Weekend")) +
+  labs(
+    title = "Average Duration: Weekday vs Weekend by Vendor",
+    x = "",
+    y = "Average Duration (seconds)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "top"
+  )
+```
+
+---
+
+# Time Series Analysis
+
+## Daily Trend
+
+```{r daily_trend}
+daily_trend <- train[, .(
+  avg_duration = mean(trip_duration),
+  median_duration = median(trip_duration),
+  total_trips = .N
+), by = date][order(date)]
+
+ggplot(daily_trend, aes(x = date, y = avg_duration)) +
+  geom_line(color = "#2E86AB", size = 0.8) +
+  geom_smooth(method = "loess", color = "#A23B72", se = TRUE) +
+  labs(
+    title = "Daily Average Trip Duration Over Time",
+    x = "Date",
+    y = "Average Duration (seconds)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+**Key Insight:** 일별 평균 여행시간에 명확한 주기적 패턴이 보입니다 (주중/주말 효과).
+
+## Monthly Pattern
+
+```{r monthly_pattern}
+monthly_pattern <- train[, .(
+  avg_duration = mean(trip_duration),
+  median_duration = median(trip_duration),
+  total_trips = .N
+), by = month][order(month)]
+
+monthly_pattern
+```
+
+```{r monthly_plot}
+ggplot(monthly_pattern, aes(x = factor(month), y = avg_duration)) +
+  geom_col(fill = "#2E86AB", alpha = 0.8) +
+  geom_text(aes(label = round(avg_duration, 0)), vjust = -0.5) +
+  labs(
+    title = "Average Trip Duration by Month",
+    x = "Month",
+    y = "Average Duration (seconds)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+## Trip Volume Over Time
+
+```{r trip_volume}
+ggplot(daily_trend, aes(x = date, y = total_trips)) +
+  geom_line(color = "#2E86AB", size = 0.8) +
+  labs(
+    title = "Daily Trip Volume Over Time",
+    x = "Date",
+    y = "Number of Trips"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+**Key Insight:** 일일 승차 건수는 대체로 안정적이며, 특정 이벤트나 공휴일에 변화가 있습니다.
+
+---
+
+# A/B Test: Vendor Comparison
+
+## Vendor Statistics
+
+```{r vendor_comparison}
+vendor_comparison <- train[, .(
+  avg_duration = mean(trip_duration),
+  median_duration = median(trip_duration),
+  sd_duration = sd(trip_duration),
+  avg_distance = mean(distance_km),
+  total_trips = .N
+), by = vendor_id]
+
+vendor_comparison
+```
+
+## Statistical Significance Test
+
+```{r vendor_ttest}
+vendor1_duration <- train[vendor_id == 1, trip_duration]
+vendor2_duration <- train[vendor_id == 2, trip_duration]
+
+t_test_result <- t.test(vendor1_duration, vendor2_duration)
+t_test_result
+```
+
+```{r cohens_d}
+cohens_d <- (mean(vendor1_duration) - mean(vendor2_duration)) / 
+  sqrt((sd(vendor1_duration)^2 + sd(vendor2_duration)^2) / 2)
+
+cat("Cohen's d (effect size):", round(cohens_d, 4), "\n")
+```
+
+**Interpretation:** 
+- p-value < 0.05: 두 vendor 간 통계적으로 유의미한 차이 있음
+- Cohen's d = `r round(cohens_d, 4)`: 효과 크기는 `r ifelse(abs(cohens_d) < 0.2, "매우 작음", ifelse(abs(cohens_d) < 0.5, "작음", ifelse(abs(cohens_d) < 0.8, "중간", "큼")))`
+
+## Duration Distribution by Vendor
+
+```{r vendor_boxplot}
+ggplot(train, aes(x = factor(vendor_id), y = trip_duration/60)) +
+  geom_boxplot(fill = "#2E86AB", alpha = 0.6, outlier.alpha = 0.1) +
+  stat_summary(fun = mean, geom = "point", color = "#A23B72", size = 3) +
+  labs(
+    title = "Trip Duration Distribution by Vendor",
+    subtitle = "Red dot = mean, box = median and quartiles",
+    x = "Vendor ID",
+    y = "Trip Duration (minutes)"
+  ) +
+  coord_cartesian(ylim = c(0, 30)) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, size = 10)
+  )
+```
+
+## Hourly Pattern by Vendor
+
+```{r hourly_vendor}
+hourly_vendor <- train[, .(
+  avg_duration = mean(trip_duration)
+), by = .(hour, vendor_id)]
+
+ggplot(hourly_vendor, aes(x = hour, y = avg_duration, 
+                           color = factor(vendor_id), group = vendor_id)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  scale_color_manual(
+    values = c("1" = "#2E86AB", "2" = "#A23B72"),
+    name = "Vendor"
+  ) +
+  labs(
+    title = "Hourly Trip Duration Pattern by Vendor",
+    x = "Hour of Day",
+    y = "Average Duration (seconds)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "top"
+  )
+```
+
+---
+
+# K-Fold Cross Validation
+
+```{r prepare_cv_data}
+# Prepare model data
+model_df <- train[, .(
+  trip_duration, 
+  distance_km, 
+  hour, 
+  is_weekend, 
+  passenger_count
+)]
+
+# Sample for faster computation
+set.seed(42)
+cv_sample <- model_df[sample(.N, min(100000, .N))]
+
+cat("Sample size for CV:", comma(nrow(cv_sample)), "\n")
+```
+
+```{r cv_setup}
+# Set up 5-fold CV
+train_control <- trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = FALSE
+)
+```
+
+## Linear Regression with CV
+
+```{r lm_cv}
+lm_cv <- train(
+  log1p(trip_duration) ~ distance_km + hour + is_weekend + passenger_count,
+  data = cv_sample,
+  method = "lm",
+  trControl = train_control
+)
+
+lm_cv
+```
+
+## Decision Tree with CV
+
+```{r tree_cv}
+tree_cv <- train(
+  log1p(trip_duration) ~ distance_km + hour + is_weekend + passenger_count,
+  data = cv_sample,
+  method = "rpart",
+  trControl = train_control,
+  tuneGrid = expand.grid(cp = c(0.001, 0.01, 0.05))
+)
+
+tree_cv
+```
+
+**Best CP:** `r tree_cv$bestTune$cp`
+
+## Random Forest with CV
+
+```{r rf_cv}
+rf_cv <- train(
+  log1p(trip_duration) ~ distance_km + hour + is_weekend + passenger_count,
+  data = cv_sample[1:30000],  # Reduced sample for faster computation
+  method = "rf",
+  trControl = trainControl(method = "cv", number = 3),  # 3-fold instead of 5
+  tuneGrid = expand.grid(mtry = 2),  # Single parameter
+  ntree = 20  # Reduced number of trees
+)
+
+rf_cv
+```
+
+**Best mtry:** `r rf_cv$bestTune$mtry`
+
+## CV Results Summary
+
+```{r cv_results}
+cv_results <- data.table(
+  Model = c("Linear Regression", "Decision Tree", "Random Forest"),
+  CV_RMSE = c(
+    lm_cv$results$RMSE,
+    min(tree_cv$results$RMSE),
+    min(rf_cv$results$RMSE)
+  ),
+  CV_Rsquared = c(
+    lm_cv$results$Rsquared,
+    max(tree_cv$results$Rsquared),
+    max(rf_cv$results$Rsquared)
+  )
+)
+
+cv_results
+```
+
+**Best Model (by CV RMSE):** `r cv_results[which.min(CV_RMSE), Model]`
+
+---
+
+# Feature Importance Comparison
+
+```{r train_models_importance}
+# Train models on sample for importance
+set.seed(42)
+importance_sample <- model_df[sample(.N, 100000)]
+
+# Linear Regression
+lm_model <- lm(
+  log1p(trip_duration) ~ distance_km + hour + is_weekend + passenger_count,
+  data = importance_sample
+)
+
+lm_importance <- data.table(
+  Feature = names(coef(lm_model))[-1],
+  Importance = abs(coef(lm_model)[-1]),
+  Model = "Linear Regression"
+)
+
+# Decision Tree
+tree_model <- rpart(
+  log1p(trip_duration) ~ distance_km + hour + is_weekend + passenger_count,
+  data = importance_sample,
+  control = rpart.control(cp = 0.01, maxdepth = 5)
+)
+
+tree_importance <- data.table(
+  Feature = names(tree_model$variable.importance),
+  Importance = tree_model$variable.importance,
+  Model = "Decision Tree"
+)
+
+# Random Forest
+rf_model <- randomForest(
+  log1p(trip_duration) ~ distance_km + hour + is_weekend + passenger_count,
+  data = importance_sample,
+  ntree = 100,
+  importance = TRUE
+)
+
+rf_importance <- data.table(
+  Feature = rownames(importance(rf_model)),
+  Importance = importance(rf_model)[, "%IncMSE"],
+  Model = "Random Forest"
+)
+```
+
+```{r combine_importance}
+# Combine and normalize
+all_importance <- rbind(lm_importance, tree_importance, rf_importance)
+all_importance[, Importance_Normalized := Importance / max(Importance), by = Model]
+
+# Clean feature names
+all_importance[Feature == "is_weekendTRUE", Feature := "is_weekend"]
+
+all_importance
+```
+
+```{r plot_importance}
+ggplot(all_importance, aes(x = reorder(Feature, Importance_Normalized), 
+                            y = Importance_Normalized, fill = Model)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  scale_fill_manual(values = c("#2E86AB", "#A23B72", "#F18F01")) +
+  labs(
+    title = "Feature Importance Comparison Across Models",
+    x = "Feature",
+    y = "Normalized Importance"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "top"
+  )
+```
+
+**Key Insight:** 모든 모델에서 `distance_km`이 가장 중요한 변수로 나타났습니다.
+
+---
+
+# Residual Analysis
+
+```{r prepare_residuals}
+# Get predictions
+y_true <- log1p(importance_sample$trip_duration)
+pred_lm <- predict(lm_model, importance_sample)
+pred_tree <- predict(tree_model, importance_sample)
+pred_rf <- predict(rf_model, importance_sample)
+
+# Calculate residuals
+residuals_df <- data.table(
+  actual = y_true,
+  pred_lm = pred_lm,
+  pred_tree = pred_tree,
+  pred_rf = pred_rf
+)
+
+residuals_df[, resid_lm := actual - pred_lm]
+residuals_df[, resid_tree := actual - pred_tree]
+residuals_df[, resid_rf := actual - pred_rf]
+```
+
+## Residual Statistics
+
+```{r residual_stats}
+residual_stats <- data.table(
+  Model = c("Linear Regression", "Decision Tree", "Random Forest"),
+  Mean = c(
+    mean(residuals_df$resid_lm),
+    mean(residuals_df$resid_tree),
+    mean(residuals_df$resid_rf)
+  ),
+  SD = c(
+    sd(residuals_df$resid_lm),
+    sd(residuals_df$resid_tree),
+    sd(residuals_df$resid_rf)
+  )
+)
+
+residual_stats
+```
+
+## Residuals vs Fitted
+
+```{r residuals_fitted}
+ggplot(residuals_df, aes(x = pred_lm, y = resid_lm)) +
+  geom_point(alpha = 0.3, color = "#2E86AB") +
+  geom_hline(yintercept = 0, color = "#A23B72", linetype = "dashed", size = 1) +
+  geom_smooth(color = "#F18F01", se = FALSE) +
+  labs(
+    title = "Residual Plot - Linear Regression",
+    x = "Fitted Values",
+    y = "Residuals"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+**Interpretation:** 잔차가 0을 중심으로 무작위로 분포하면 좋은 모델입니다.
+
+## Residual Distribution
+
+```{r residual_distribution}
+residuals_long <- melt(
+  residuals_df[, .(resid_lm, resid_tree, resid_rf)],
+  measure.vars = c("resid_lm", "resid_tree", "resid_rf"),
+  variable.name = "Model",
+  value.name = "Residual"
+)
+
+# Convert to data.table if needed
+residuals_long <- as.data.table(residuals_long)
+
+residuals_long[, Model := factor(Model, 
+                                  labels = c("Linear Regression", 
+                                           "Decision Tree", 
+                                           "Random Forest"))]
+
+ggplot(residuals_long, aes(x = Residual, fill = Model)) +
+  geom_histogram(bins = 50, alpha = 0.6, position = "identity") +
+  facet_wrap(~Model, ncol = 1, scales = "free_y") +
+  scale_fill_manual(values = c("#2E86AB", "#A23B72", "#F18F01")) +
+  labs(
+    title = "Residual Distribution by Model",
+    x = "Residual",
+    y = "Count"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "none"
+  )
+```
+
+## Q-Q Plot
+
+```{r qq_plot}
+ggplot(residuals_df, aes(sample = resid_lm)) +
+  stat_qq(color = "#2E86AB", alpha = 0.5) +
+  stat_qq_line(color = "#A23B72", size = 1) +
+  labs(
+    title = "Q-Q Plot - Linear Regression",
+    subtitle = "Checking normality of residuals",
+    x = "Theoretical Quantiles",
+    y = "Sample Quantiles"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, size = 10)
+  )
+```
+
+Interpretation: 점들이 직선에 가까울수록 잔차가 정규분포를 따릅니다.
+
+## Predicted vs Actual
+
+```{r predicted_actual}
+predictions_long <- melt(
+  residuals_df[, .(actual, pred_lm, pred_tree, pred_rf)],
+  id.vars = "actual",
+  measure.vars = c("pred_lm", "pred_tree", "pred_rf"),
+  variable.name = "Model",
+  value.name = "Predicted"
+)
+
+# Convert to data.table if needed
+predictions_long <- as.data.table(predictions_long)
+
+predictions_long[, Model := factor(Model, 
+                                    labels = c("Linear Regression", 
+                                             "Decision Tree", 
+                                             "Random Forest"))]
+
+ggplot(predictions_long[sample(.N, 5000)], 
+       aes(x = actual, y = Predicted, color = Model)) +
+  geom_point(alpha = 0.3) +
+  geom_abline(intercept = 0, slope = 1, color = "black", linetype = "dashed") +
+  facet_wrap(~Model) +
+  scale_color_manual(values = c("#2E86AB", "#A23B72", "#F18F01")) +
+  labs(
+    title = "Predicted vs Actual Values",
+    x = "Actual log1p(Duration)",
+    y = "Predicted log1p(Duration)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "none"
+  )
+```
+
+Interpretation: 점들이 대각선(y=x)에 가까울수록 예측이 정확합니다.
